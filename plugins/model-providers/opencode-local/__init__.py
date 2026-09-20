@@ -1,11 +1,13 @@
 """OpenCode Local provider profile.
 
 ``opencode-local`` does not speak OpenAI-over-HTTP against a hosted endpoint: it spawns
-``opencode serve`` as a local subprocess and drives its HTTP API, so the profile supplies its own
-client via :meth:`ProviderProfile.create_client` — same seam as ``copilot-acp``, HTTP instead of
-stdio/ACP. See ``hermes_cli/auth.py``'s unknown-provider hint for why a local server exists at
-all: OpenCode's hosted Zen/Go relay 403s anonymous access from anything but its own client
-(FreeTierError), and the local server IS that official client.
+``opencode serve`` as a local subprocess and drives its session/SSE HTTP API (see
+``agent/opencode_local_client.py`` for the protocol — verified against a live server, not the
+hosted Zen/Go relay's wire shape), so the profile supplies its own client via
+:meth:`ProviderProfile.create_client` — same seam as ``copilot-acp``, HTTP instead of stdio/ACP.
+See ``hermes_cli/auth.py``'s unknown-provider hint for why a local server exists at all: OpenCode's
+hosted Zen/Go relay 403s anonymous access from anything but its own client (FreeTierError), and the
+local server IS that official client.
 """
 
 from typing import Any
@@ -13,19 +15,19 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
-# Curated fallback catalog spanning every wire dialect opencode-local routes between (see
-# ``agent.opencode_local_client.opencode_local_model_api_mode``): Muse Spark / GPT / Grok ->
-# codex_responses, Claude / MiniMax / Qwen -> anthropic_messages, everything else -> chat_completions.
+# Model ids are "providerID/modelID" (opencode's own /config/providers catalog, not a flat name —
+# a bare model id is ambiguous once opencode has more than one provider configured). This is
+# opencode's OWN bundled "opencode" provider (OpenCode Zen's free tier, verified against a live
+# server): the one catalog that exists on every install regardless of what other providers
+# (OpenRouter, Anthropic, ...) a given user has separately configured inside their opencode CLI.
 _FALLBACK_MODELS = (
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "gpt-5.1-codex",
-    "grok-4.1",
-    "muse-spark-1.3-contributor",
-    "minimax-m2.5",
-    "qwen3.7-max",
-    "glm-5.2",
-    "deepseek-v4-pro",
+    "opencode/big-pickle",
+    "opencode/muse-spark-1.3-contributor-free",
+    "opencode/muse-spark-1.2-contributor-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/ling-3.0-flash-fin-free",
 )
 
 
@@ -63,7 +65,9 @@ opencode_local = OpencodeLocalProfile(
     name="opencode-local", aliases=("opencode-serve", "opencode-local-server"),
     display_name="OpenCode Local", description="OpenCode CLI (local `opencode serve` subprocess, no relay)",
     signup_url="https://opencode.ai",
-    api_mode="chat_completions",  # hint/fallback only — real routing is per-model, inside the client
+    # OpencodeLocalClient always presents a chat_completions-shaped facade to Hermes (like
+    # copilot-acp) regardless of which opencode-internal provider/model backs a given session.
+    api_mode="chat_completions",
     env_vars=(),  # managed by the opencode CLI's own auth, not Hermes
     base_url="opencode-local://127.0.0.1",  # internal marker scheme, resolved to a real localhost port at spawn time
     auth_type="external_process",
@@ -72,7 +76,8 @@ opencode_local = OpencodeLocalProfile(
     process_command_env_vars=("HERMES_OPENCODE_LOCAL_COMMAND",),
     process_args_env_var="HERMES_OPENCODE_LOCAL_ARGS",
     fallback_models=_FALLBACK_MODELS,
-    default_aux_model="claude-haiku-4-5-20251001",
+    # No universal cheap aux pick: which models are fast/cheap depends entirely on what the
+    # user's own opencode CLI has configured. Falls through to the main model (base default).
 )
 
 register_provider(opencode_local)

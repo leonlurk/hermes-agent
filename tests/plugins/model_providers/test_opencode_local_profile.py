@@ -1,9 +1,9 @@
 """Unit tests for the OpenCode Local provider profile.
 
-``opencode-local`` spawns ``opencode serve`` as a subprocess and drives its local HTTP API,
-mirroring the ``copilot-acp`` plugin's ``auth_type="external_process"`` pattern (stdio/ACP
-swapped for HTTP). See ``agent/opencode_local_client.py`` for the subprocess lifecycle and
-per-model wire-dialect routing; this file only covers the ``ProviderProfile`` contract.
+``opencode-local`` spawns ``opencode serve`` as a subprocess and drives its local session/SSE
+HTTP API, mirroring the ``copilot-acp`` plugin's ``auth_type="external_process"`` pattern
+(stdio/ACP swapped for HTTP). See ``agent/opencode_local_client.py`` for the subprocess lifecycle
+and turn protocol; this file only covers the ``ProviderProfile`` contract.
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ class TestOpencodeLocalProfileIdentity:
     def test_auth_type(self, opencode_local_profile):
         assert opencode_local_profile.auth_type == "external_process"
 
-    def test_api_mode_is_a_hint_not_the_real_router(self, opencode_local_profile):
-        # The real per-model dialect selection lives in OpencodeLocalClient; this field is only
-        # the fallback the docs describe ("acts as a hint").
+    def test_api_mode_is_the_bridge_facade(self, opencode_local_profile):
+        # OpencodeLocalClient always presents a chat_completions-shaped facade to Hermes, like
+        # copilot-acp — regardless of which opencode-internal provider/model backs the session.
         assert opencode_local_profile.api_mode == "chat_completions"
 
     def test_no_env_vars_subprocess_owns_auth(self, opencode_local_profile):
@@ -49,11 +49,12 @@ class TestOpencodeLocalProfileIdentity:
         assert "HERMES_OPENCODE_LOCAL_COMMAND" in opencode_local_profile.process_command_env_vars
         assert opencode_local_profile.process_args_env_var == "HERMES_OPENCODE_LOCAL_ARGS"
 
-    def test_fallback_models_cover_every_wire_dialect(self, opencode_local_profile):
-        from agent.opencode_local_client import opencode_local_model_api_mode
-
-        modes = {opencode_local_model_api_mode(m) for m in opencode_local_profile.fallback_models}
-        assert modes == {"chat_completions", "codex_responses", "anthropic_messages"}
+    def test_fallback_models_are_qualified_provider_model_ids(self, opencode_local_profile):
+        # A bare model id is ambiguous once more than one provider is configured inside opencode
+        # (see OpencodeLocalClient._split_qualified_model) — every fallback must carry a provider.
+        for model in opencode_local_profile.fallback_models:
+            provider_id, _, model_id = model.partition("/")
+            assert provider_id and model_id, f"not a qualified providerID/modelID: {model!r}"
 
     def test_display_name_and_description(self, opencode_local_profile):
         assert "OpenCode" in opencode_local_profile.display_name

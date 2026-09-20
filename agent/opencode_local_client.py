@@ -1,22 +1,34 @@
-"""OpenAI-compatible shim that drives a local ``opencode serve`` subprocess over HTTP.
+"""OpenAI-compatible shim that drives a local ``opencode serve`` subprocess over its HTTP
+session API.
 
-``opencode-local`` spawns and owns one long-lived ``opencode serve`` process (lazy start,
-health-checked, cleaned up at exit) instead of hitting OpenCode's hosted Zen/Go relay directly.
-The relay 403s anonymous access from anything but its own client (see the unknown-provider hint
-in ``hermes_cli/auth.py``); the local server IS that official client, so it carries its own
-trusted session instead of an ``OPENCODE_*_API_KEY``.
+``opencode serve`` is NOT an OpenAI-compatible relay: ``/v1/chat/completions``, ``/v1/responses``
+and ``/v1/messages`` do not exist on it — the server answers 200 with its SPA's HTML for any
+unrecognized path, which silently defeats a naive health check or JSON parse. It is a session+SSE
+agent server, the same one its own TUI talks to (verified against a live ``opencode serve``
+v1.18.31 instance; see ``files/openapi-doc.json`` / ``files/NOTES.md`` for the captured evidence
+this module is built from). A turn is: ``POST /session`` (model is set HERE, never on the prompt —
+sending ``model`` on ``prompt_async`` reproducibly crashes the session with a SQLite
+``NOT NULL constraint failed: session_message.seq`` error via ``session.next.agent.switched`` on
+this server version) -> open ``GET /event`` (SSE) -> ``POST /session/{id}/prompt_async`` -> wait for
+``session.idle`` / ``session.error`` -> ``GET /session/{id}/message`` as the ground truth of what the
+turn produced (mirrors the TUI's own read-after-write pattern; SSE parts are not used to reconstruct
+content because there is no confirmed evidence they are true deltas rather than full-state resends).
 
-Unlike Copilot ACP (a short-lived session per request), ``opencode serve`` is meant to run as a
-persistent local server, so the subprocess is a process-wide singleton reused across requests
-rather than spawned per call.
+Like Copilot ACP, ``opencode serve`` is an AUTONOMOUS AGENT CLI with its OWN tools (bash/edit/read,
+executed against ITS OWN cwd) — not a raw model backend Hermes' tool loop plugs into, and its wire
+has no channel to hand it Hermes' custom tool schemas (``prompt_async.tools`` is only an
+enable/disable map for opencode's OWN built-in tool ids, from ``GET /experimental/tool/ids``). So,
+exactly like ``copilot_acp_client.py``: every one of opencode's built-in tools is disabled per
+request, and Hermes' tool schemas travel IN as prompt text via the shared ``acp_openai_bridge``
+helpers, parsed back OUT of the final text — same contract, HTTP+session/SSE transport instead of
+stdio+ACP. Reasoning arrives as opencode's own ``reasoning`` message parts, kept on a distinct field
+(``message.reasoning`` / ``reasoning_content``) rather than folded into the visible response text.
 
-The local server mirrors the hosted relay's per-model wire dialect (``_OPENCODE_API_MODE_PREFIXES``
-in ``hermes_cli/models.py``): Muse Spark / GPT / Grok speak the Responses API, Claude / MiniMax /
-Qwen speak the Messages API, everything else speaks Chat Completions. Picking the right dialect per
-model is what makes reasoning arrive as structured thinking and tool calls arrive as structured
-events instead of prose — the wrong dialect is the actual cause of both failure modes, not
-something that needs a separate text-scraping workaround (contrast ``acp_openai_bridge.py``, which
-DOES need one because ACP has no tools/tool_calls channel at all).
+Unlike Copilot ACP (a short-lived session per request), ``opencode serve`` itself is meant to run as
+a persistent local server, so the SUBPROCESS is a process-wide singleton reused across requests;
+each Hermes turn still gets its own ephemeral opencode session (created, prompted, read, deleted),
+which sidesteps opencode accumulating server-side conversation state Hermes does not control --
+Hermes already resends the full transcript on every call, exactly like every other provider.
 """
 
 from __future__ import annotations
@@ -37,7 +49,11 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
-from agent.acp_openai_bridge import build_openai_tool_call
+from agent.acp_openai_bridge import (
+    completion_to_stream_chunks as _completion_to_stream_chunks,
+    extract_tool_calls_from_text as _extract_tool_calls_from_text,
+    render_tool_bridge_sections as _render_tool_bridge_sections,
+)
 from tools.environments.local import hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -46,27 +62,54 @@ OPENCODE_LOCAL_MARKER_BASE_URL = "opencode-local://127.0.0.1"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 _HEALTH_CHECK_TIMEOUT_SECONDS = 20.0
 _HEALTH_CHECK_INTERVAL_SECONDS = 0.2
+_EVENT_CONNECT_TIMEOUT_SECONDS = 10.0
+# Fixed at both session create and prompt time: a mismatch (or a model on prompt_async) trips the
+# `session.next.agent.switched` SQLite crash described in the module docstring.
+_AGENT_PRESET = "build"
 
-# Per-model wire dialect the local server speaks, mirroring ``_OPENCODE_API_MODE_PREFIXES``
-# (hermes_cli/models.py) for the hosted Zen/Go relay. Checked in order; first match wins.
-_API_MODE_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("muse-spark", "gpt-", "grok-"), "codex_responses"),
-    (("claude-", "minimax-", "qwen"), "anthropic_messages"),
+_ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
+_PROMPT_PREAMBLE = (
+    "You are being used as the active local-agent backend for Hermes.",
+    "Do not use any of your own tools to take action — none are available to you here.",
+    "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+    "If no tool is needed, answer normally.",
 )
 
 
-def opencode_local_model_api_mode(model: str | None) -> str:
-    """Wire dialect ``opencode serve`` speaks locally for *model* (see ``_API_MODE_PREFIXES``).
+def _render_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text") or "").strip()
+        return content["content"].strip() if isinstance(content.get("content"), str) else json.dumps(content, ensure_ascii=True)
+    if isinstance(content, list):
+        parts = [item if isinstance(item, str) else item["text"].strip() for item in content if isinstance(item, str)
+                 or (isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip())]
+        return "\n".join(parts).strip()
+    return str(content).strip()
 
-    A single fixed dialect is wrong for all but one model family: Claude's extended-thinking
-    blocks and OpenAI Responses reasoning items only round-trip correctly on their native
-    endpoints, so every request is routed per-model rather than per-provider.
-    """
-    normalized = str(model or "").strip().lower()
-    for prefixes, mode in _API_MODE_PREFIXES:
-        if normalized.startswith(prefixes):
-            return mode
-    return "chat_completions"
+
+def _format_messages_as_prompt(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, tool_choice: Any = None,
+) -> str:
+    sections: list[str] = [*_PROMPT_PREAMBLE, *_render_tool_bridge_sections(tools, tool_choice)]
+    transcript: list[str] = []
+    for message in (m for m in messages if isinstance(m, dict)):
+        role = str(message.get("role") or "unknown").strip().lower()
+        if rendered := _render_message_content(message.get("content")):
+            transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
+    if transcript:
+        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+    sections.append("Continue the conversation from the latest user request.")
+    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+
+
+def _split_qualified_model(model: str | None) -> tuple[str, str]:
+    """``"<providerID>/<modelID>"`` -> ``(providerID, modelID)``. ``modelID`` may itself contain
+    ``/`` (e.g. OpenRouter's own ``qwen/qwen3.7-max``), so only the FIRST segment is the provider."""
+    provider_id, _, model_id = str(model or "").strip().partition("/")
+    return provider_id, model_id
 
 
 # ── Subprocess lifecycle ─────────────────────────────────────────────────────────────────────
@@ -122,6 +165,26 @@ def _windows_hide_flags() -> int:
         return 0
 
 
+def _get_json(base: str, path: str, timeout: float) -> Any:
+    req = urllib.request.Request(base.rstrip("/") + path)
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _post_json(base: str, path: str, body: Any, timeout: float) -> tuple[int, Any]:
+    data = json.dumps(body if body is not None else {}).encode("utf-8")
+    req = urllib.request.Request(base.rstrip("/") + path, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"opencode serve {path} failed: HTTP {exc.code} {exc.read().decode('utf-8', 'replace')[:500]}") from exc
+    return status, (json.loads(raw.decode("utf-8")) if raw else None)
+
+
 class _OpencodeLocalServer:
     """One lazily-spawned, health-checked ``opencode serve`` process, shared by every client
     instance in this process that was built with the same command/args. A second caller racing
@@ -137,6 +200,8 @@ class _OpencodeLocalServer:
         self._base_url = ""
         self._external = False
         self._lock = threading.Lock()
+        self._disabled_tools: dict[str, bool] | None = None
+        self._disabled_tools_lock = threading.Lock()
 
     @classmethod
     def get(cls, command: str, args: list[str]) -> "_OpencodeLocalServer":
@@ -157,6 +222,25 @@ class _OpencodeLocalServer:
                 return self._base_url
             self._spawn_and_wait(timeout_seconds)
             return self._base_url
+
+    def disabled_tools_map(self, *, timeout_seconds: float) -> dict[str, bool]:
+        """``{tool_id: False, ...}`` for every one of opencode's OWN built-in tools, so a turn
+        never executes anything server-side — Hermes' tool loop stays the single source of truth
+        for what actually runs. Fetched once per server and cached; a fetch failure degrades to an
+        empty map (server default tool set stays enabled) rather than failing the whole turn."""
+        with self._disabled_tools_lock:
+            if self._disabled_tools is not None:
+                return self._disabled_tools
+        base = self.base_url(timeout_seconds=timeout_seconds)
+        try:
+            ids = _get_json(base, "/experimental/tool/ids", timeout_seconds) or []
+            disabled = {str(i): False for i in ids if isinstance(i, str) and i.strip()}
+        except Exception:
+            logger.debug("opencode-local: could not fetch /experimental/tool/ids", exc_info=True)
+            disabled = {}
+        with self._disabled_tools_lock:
+            self._disabled_tools = disabled
+        return disabled
 
     def _spawn_and_wait(self, timeout_seconds: float) -> None:
         port = _resolve_configured_port() or _free_port()
@@ -184,13 +268,13 @@ class _OpencodeLocalServer:
                     f"{stderr_text or '(no stderr)'}"
                 )
             try:
-                with urllib.request.urlopen(base_url + "/", timeout=1.0) as resp:
+                with urllib.request.urlopen(base_url + "/global/health", timeout=1.0) as resp:
                     resp.read(1)
                 healthy = True
                 break
-            except Exception as exc:  # server not listening yet, or a 4xx/5xx root — both mean "alive enough"
+            except Exception as exc:
                 if isinstance(exc, urllib.error.HTTPError):
-                    healthy = True
+                    healthy = True  # server answered (even an error status) — it is up
                     break
                 last_error = exc
                 time.sleep(_HEALTH_CHECK_INTERVAL_SECONDS)
@@ -218,298 +302,27 @@ class _OpencodeLocalServer:
             self._shutdown()
 
 
-# ── Wire-shape conversion (OpenAI messages -> per-dialect payload) ─────────────────────────────
-
-
-def _system_and_rest(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    system_parts: list[str] = []
-    rest: list[dict[str, Any]] = []
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        if (m.get("role") or "").strip().lower() == "system":
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                system_parts.append(content.strip())
-        else:
-            rest.append(m)
-    return "\n\n".join(system_parts), rest
-
-
-def _text_of(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")]
-        return "\n".join(p for p in parts if p)
-    return ""
-
-
-def _to_chat_payload(
-    model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-    tool_choice: Any, stream: bool,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
-    if tools:
-        payload["tools"] = tools
-    if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    return payload
-
-
-def _to_responses_payload(
-    model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-    tool_choice: Any, stream: bool,
-) -> dict[str, Any]:
-    instructions, rest = _system_and_rest(messages)
-    input_items: list[dict[str, Any]] = []
-    for m in rest:
-        role = (m.get("role") or "user").strip().lower()
-        if role == "tool":
-            input_items.append({
-                "type": "function_call_output", "call_id": m.get("tool_call_id") or "",
-                "output": _text_of(m.get("content")),
-            })
-            continue
-        for call in m.get("tool_calls") or []:
-            fn = call.get("function") or {}
-            input_items.append({
-                "type": "function_call", "call_id": call.get("id") or "", "name": fn.get("name") or "",
-                "arguments": fn.get("arguments") or "{}",
-            })
-        text = _text_of(m.get("content"))
-        if text:
-            input_items.append({
-                "type": "message", "role": "assistant" if role == "assistant" else "user",
-                "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": text}],
-            })
-    payload: dict[str, Any] = {"model": model, "input": input_items, "stream": stream}
-    if instructions:
-        payload["instructions"] = instructions
-    if tools:
-        payload["tools"] = [
-            {"type": "function", "name": (t.get("function") or {}).get("name"),
-             "description": (t.get("function") or {}).get("description", ""),
-             "parameters": (t.get("function") or {}).get("parameters", {})}
-            for t in tools if isinstance(t, dict) and t.get("function")
-        ]
-    if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    return payload
-
-
-_ANTHROPIC_TOOL_CHOICE = {"auto": {"type": "auto"}, "required": {"type": "any"}, "none": None}
-
-
-def _to_anthropic_payload(
-    model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-    tool_choice: Any, stream: bool, *, max_tokens: int,
-) -> dict[str, Any]:
-    system, rest = _system_and_rest(messages)
-    anthropic_messages: list[dict[str, Any]] = []
-    for m in rest:
-        role = (m.get("role") or "user").strip().lower()
-        if role == "tool":
-            anthropic_messages.append({
-                "role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": m.get("tool_call_id") or "",
-                    "content": _text_of(m.get("content")),
-                }],
-            })
-            continue
-        blocks: list[dict[str, Any]] = []
-        text = _text_of(m.get("content"))
-        if text:
-            blocks.append({"type": "text", "text": text})
-        for call in m.get("tool_calls") or []:
-            fn = call.get("function") or {}
-            try:
-                arguments = json.loads(fn.get("arguments") or "{}")
-            except Exception:
-                arguments = {}
-            blocks.append({"type": "tool_use", "id": call.get("id") or "", "name": fn.get("name") or "", "input": arguments})
-        if blocks:
-            anthropic_messages.append({"role": "assistant" if role == "assistant" else "user", "content": blocks})
-    payload: dict[str, Any] = {
-        "model": model, "messages": anthropic_messages, "max_tokens": max_tokens, "stream": stream,
-    }
-    if system:
-        payload["system"] = system
-    if tools:
-        payload["tools"] = [
-            {"name": (t.get("function") or {}).get("name"), "description": (t.get("function") or {}).get("description", ""),
-             "input_schema": (t.get("function") or {}).get("parameters", {})}
-            for t in tools if isinstance(t, dict) and t.get("function")
-        ]
-    if isinstance(tool_choice, str) and tool_choice in _ANTHROPIC_TOOL_CHOICE:
-        choice = _ANTHROPIC_TOOL_CHOICE[tool_choice]
-        if choice is not None:
-            payload["tool_choice"] = choice
-        else:
-            payload.pop("tools", None)
-    return payload
-
-
-# ── Response parsing (per-dialect JSON -> uniform text/reasoning/tool_calls) ───────────────────
-
-
-def _parse_chat_response(data: dict[str, Any]) -> tuple[str, str, list[Any], str]:
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    tool_calls = [
-        build_openai_tool_call(
-            call_id=tc.get("id") or f"call_{i}", name=(tc.get("function") or {}).get("name") or "",
-            arguments=(tc.get("function") or {}).get("arguments") or "{}",
-        )
-        for i, tc in enumerate(message.get("tool_calls") or [])
-    ]
-    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-    finish_reason = choice.get("finish_reason") or ("tool_calls" if tool_calls else "stop")
-    return message.get("content") or "", reasoning, tool_calls, finish_reason
-
-
-def _parse_responses_response(data: dict[str, Any]) -> tuple[str, str, list[Any], str]:
-    text_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: list[Any] = []
-    for item in data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type == "message":
-            for part in item.get("content") or []:
-                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
-                    text_parts.append(part.get("text") or "")
-        elif item_type == "reasoning":
-            for part in item.get("summary") or item.get("content") or []:
-                if isinstance(part, dict):
-                    reasoning_parts.append(part.get("text") or "")
-                elif isinstance(part, str):
-                    reasoning_parts.append(part)
-        elif item_type == "function_call":
-            tool_calls.append(build_openai_tool_call(
-                call_id=item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}",
-                name=item.get("name") or "", arguments=item.get("arguments") or "{}",
-            ))
-    finish_reason = "tool_calls" if tool_calls else "stop"
-    return "".join(text_parts), "".join(reasoning_parts), tool_calls, finish_reason
-
-
-def _parse_anthropic_response(data: dict[str, Any]) -> tuple[str, str, list[Any], str]:
-    text_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: list[Any] = []
-    for block in data.get("content") or []:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "text":
-            text_parts.append(block.get("text") or "")
-        elif block_type == "thinking":
-            reasoning_parts.append(block.get("thinking") or "")
-        elif block_type == "tool_use":
-            tool_calls.append(build_openai_tool_call(
-                call_id=block.get("id") or f"call_{len(tool_calls)}", name=block.get("name") or "",
-                arguments=json.dumps(block.get("input") or {}, ensure_ascii=False),
-            ))
-    stop_reason = data.get("stop_reason")
-    finish_reason = "tool_calls" if tool_calls else ("length" if stop_reason == "max_tokens" else "stop")
-    return "".join(text_parts), "".join(reasoning_parts), tool_calls, finish_reason
-
-
-_ENDPOINTS = {
-    "chat_completions": "/v1/chat/completions",
-    "codex_responses": "/v1/responses",
-    "anthropic_messages": "/v1/messages",
-}
-
-
-def _effective_timeout(timeout: Any) -> float:
-    if isinstance(timeout, (int, float)):
-        return float(timeout)
-    candidates = [getattr(timeout, attr, None) for attr in ("read", "write", "connect", "pool", "timeout")]
-    return max((float(v) for v in candidates if isinstance(v, (int, float))), default=_DEFAULT_TIMEOUT_SECONDS)
-
-
 # ── SSE plumbing ─────────────────────────────────────────────────────────────────────────────
 
 
-def _iter_sse_events(resp: Any) -> Iterator[dict[str, Any]]:
-    """Yield each ``data:`` JSON payload from an SSE stream, forwarding lines/chunks as they
-    arrive rather than buffering the whole body first (streamed text must keep its own line
-    breaks intact, not get re-flowed through a batch-then-rechunk pass)."""
-    data_lines: list[str] = []
+def _iter_sse_json(resp: Any) -> Iterator[dict[str, Any]]:
+    """Yield each ``data:`` line's JSON payload. opencode's ``/event`` stream carries no ``event:``
+    field and one complete JSON object per ``data:`` line (no observed multi-line data blocks), so
+    this stays a simple per-line parse rather than the buffer-until-blank-line SSE dance."""
     for raw_line in resp:
         line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-        line = line.rstrip("\n").rstrip("\r")
-        if not line:
-            if data_lines:
-                payload = "\n".join(data_lines)
-                data_lines = []
-                if payload.strip() == "[DONE]":
-                    return
-                try:
-                    yield json.loads(payload)
-                except Exception:
-                    continue
+        line = line.strip("\r\n")
+        if not line or line.startswith(":"):
             continue
-        if line.startswith(":"):
-            continue  # SSE comment / keep-alive ping
-        if line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip(" "))
-    if data_lines:
-        payload = "\n".join(data_lines)
-        if payload.strip() != "[DONE]":
-            with contextlib.suppress(Exception):
-                yield json.loads(payload)
-
-
-def _chat_stream_delta(event: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]] | None, str | None]:
-    choice = (event.get("choices") or [{}])[0]
-    delta = choice.get("delta") or {}
-    tool_calls = delta.get("tool_calls")
-    return delta.get("content") or "", delta.get("reasoning_content") or delta.get("reasoning") or "", tool_calls, choice.get("finish_reason")
-
-
-def _responses_stream_delta(event: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]] | None, str | None]:
-    event_type = event.get("type") or ""
-    if event_type == "response.output_text.delta":
-        return event.get("delta") or "", "", None, None
-    if event_type == "response.reasoning_summary_text.delta":
-        return "", event.get("delta") or "", None, None
-    if event_type == "response.completed":
-        return "", "", None, "stop"
-    return "", "", None, None
-
-
-def _anthropic_stream_delta(event: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]] | None, str | None]:
-    event_type = event.get("type") or ""
-    if event_type == "content_block_delta":
-        delta = event.get("delta") or {}
-        delta_type = delta.get("type")
-        if delta_type == "text_delta":
-            return delta.get("text") or "", "", None, None
-        if delta_type == "thinking_delta":
-            return "", delta.get("thinking") or "", None, None
-        if delta_type == "input_json_delta":
-            return "", "", [{"index": event.get("index", 0), "id": None, "type": "function",
-                              "function": {"name": None, "arguments": delta.get("partial_json") or ""}}], None
-    if event_type == "content_block_start":
-        block = event.get("content_block") or {}
-        if block.get("type") == "tool_use":
-            return "", "", [{"index": event.get("index", 0), "id": block.get("id"), "type": "function",
-                              "function": {"name": block.get("name"), "arguments": ""}}], None
-    if event_type == "message_delta":
-        stop_reason = (event.get("delta") or {}).get("stop_reason")
-        if stop_reason:
-            return "", "", None, "tool_calls" if stop_reason == "tool_use" else "stop"
-    return "", "", None, None
-
-
-_STREAM_DELTA_PARSERS = {
-    "chat_completions": _chat_stream_delta, "codex_responses": _responses_stream_delta,
-    "anthropic_messages": _anthropic_stream_delta,
-}
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].lstrip(" ")
+        if not payload:
+            continue
+        try:
+            yield json.loads(payload)
+        except Exception:
+            continue
 
 
 class OpencodeLocalClient:
@@ -538,103 +351,146 @@ class OpencodeLocalClient:
         self.is_closed = True
 
     def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
+        """Model ids as ``providerID/modelID`` (opencode's own model ids may themselves contain a
+        ``/``, e.g. OpenRouter's ``qwen/qwen3.7-max``), from ``GET /config/providers`` — the local
+        server's real catalog endpoint (there is no ``/v1/models``)."""
         base = self._server.base_url(timeout_seconds=timeout_seconds)
-        req = urllib.request.Request(base.rstrip("/") + "/v1/models")
-        req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            data = json.loads(resp.read().decode())
-        items = data if isinstance(data, list) else data.get("data", [])
-        return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
+        data = _get_json(base, "/config/providers", timeout_seconds) or {}
+        return [
+            f"{provider['id']}/{model_id}"
+            for provider in (data.get("providers") or [])
+            if isinstance(provider, dict) and provider.get("id")
+            for model_id in (provider.get("models") or {}).keys()
+        ]
 
-    def _post(self, base: str, path: str, payload: dict[str, Any], *, timeout: float, stream: bool) -> Any:
-        req = urllib.request.Request(
-            base.rstrip("/") + path, data=json.dumps(payload).encode("utf-8"), method="POST",
-        )
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "text/event-stream" if stream else "application/json")
-        for k, v in self._default_headers.items():
-            req.add_header(k, v)
-        return urllib.request.urlopen(req, timeout=timeout)
-
-    def _build_payload(self, mode: str, model: str, messages: list[dict[str, Any]], tools, tool_choice, stream: bool) -> dict[str, Any]:
-        if mode == "codex_responses":
-            return _to_responses_payload(model, messages, tools, tool_choice, stream)
-        if mode == "anthropic_messages":
-            return _to_anthropic_payload(model, messages, tools, tool_choice, stream, max_tokens=8192)
-        return _to_chat_payload(model, messages, tools, tool_choice, stream)
+    # ── one turn ─────────────────────────────────────────────────────────────────────────────
 
     def _create_chat_completion(
         self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None, timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
-        mode = opencode_local_model_api_mode(model)
+        provider_id, model_id = _split_qualified_model(model)
+        if not provider_id or not model_id:
+            raise RuntimeError(
+                f"opencode-local model ids must be qualified as 'providerID/modelID' (got {model!r}). "
+                "Pick one from `hermes model` or GET /config/providers."
+            )
         request_timeout = _effective_timeout(timeout)
         base = self._server.base_url(timeout_seconds=max(_HEALTH_CHECK_TIMEOUT_SECONDS, min(request_timeout, 120.0)))
-        payload = self._build_payload(mode, model or "", messages or [], tools, tool_choice, stream)
-        if stream:
-            return self._stream_completion(base, mode, model, payload, request_timeout)
-        return self._one_shot_completion(base, mode, model, payload, request_timeout)
-
-    def _one_shot_completion(self, base: str, mode: str, model: str | None, payload: dict[str, Any], timeout: float) -> Any:
-        with self._post(base, _ENDPOINTS[mode], payload, timeout=timeout, stream=False) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        parser = {
-            "chat_completions": _parse_chat_response, "codex_responses": _parse_responses_response,
-            "anthropic_messages": _parse_anthropic_response,
-        }[mode]
-        content, reasoning, tool_calls, finish_reason = parser(data)
+        disabled_tools = self._server.disabled_tools_map(timeout_seconds=request_timeout)
+        prompt_text = _format_messages_as_prompt(messages or [], tools=tools, tool_choice=tool_choice)
+        response_text, reasoning = self._run_turn(
+            base, provider_id, model_id, prompt_text, disabled_tools, timeout_seconds=request_timeout)
+        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         message = SimpleNamespace(
-            content=content or None, tool_calls=tool_calls or None, reasoning=reasoning or None,
-            reasoning_content=reasoning or None, reasoning_details=None,
+            content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
+            reasoning_details=None,
         )
-        usage = data.get("usage") or {}
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
-            usage=SimpleNamespace(
-                prompt_tokens=usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
-                completion_tokens=usage.get("completion_tokens") or usage.get("output_tokens") or 0,
-                total_tokens=usage.get("total_tokens") or 0,
-                prompt_tokens_details=SimpleNamespace(cached_tokens=usage.get("cached_tokens") or 0),
-            ),
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="tool_calls" if tool_calls else "stop")],
+            usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
             model=model or "opencode-local",
         )
+        return _completion_to_stream_chunks(completion) if stream else completion
 
-    def _stream_completion(self, base: str, mode: str, model: str | None, payload: dict[str, Any], timeout: float) -> Iterator[Any]:
-        parse_delta = _STREAM_DELTA_PARSERS[mode]
-        resp = self._post(base, _ENDPOINTS[mode], payload, timeout=timeout, stream=True)
-        tool_call_states: dict[int, dict[str, Any]] = {}
+    def _run_turn(
+        self, base: str, provider_id: str, model_id: str, prompt_text: str, disabled_tools: dict[str, bool],
+        *, timeout_seconds: float,
+    ) -> tuple[str, str]:
+        session_body = {"title": "hermes-turn", "agent": _AGENT_PRESET, "model": {"providerID": provider_id, "id": model_id}}
+        _, session = _post_json(base, "/session", session_body, timeout_seconds)
+        sid = (session or {}).get("id")
+        if not sid:
+            raise RuntimeError("opencode serve did not return a session id.")
+        try:
+            connected = threading.Event()
+            done = threading.Event()
+            outcome: dict[str, Any] = {}
+            watcher = threading.Thread(
+                target=self._watch_events, args=(base, sid, connected, done, outcome, timeout_seconds), daemon=True)
+            watcher.start()
+            if not connected.wait(timeout=min(_EVENT_CONNECT_TIMEOUT_SECONDS, timeout_seconds)):
+                raise TimeoutError("Timed out opening the opencode serve event stream.")
 
-        def _gen() -> Iterator[Any]:
-            try:
-                for event in _iter_sse_events(resp):
-                    text, reasoning, tool_delta_raw, finish_reason = parse_delta(event)
-                    tool_call_deltas = None
-                    if tool_delta_raw:
-                        tool_call_deltas = []
-                        for raw in tool_delta_raw:
-                            index = raw.get("index", 0)
-                            state = tool_call_states.setdefault(index, {"id": None, "name": None})
-                            if raw.get("id"):
-                                state["id"] = raw["id"]
-                            fn = raw.get("function") or {}
-                            if fn.get("name"):
-                                state["name"] = fn["name"]
-                            tool_call_deltas.append(SimpleNamespace(
-                                index=index, id=raw.get("id"), type="function",
-                                function=SimpleNamespace(name=fn.get("name"), arguments=fn.get("arguments") or ""),
-                            ))
-                    if not (text or reasoning or tool_call_deltas or finish_reason):
-                        continue
-                    delta = SimpleNamespace(
-                        role="assistant", content=text or None, tool_calls=tool_call_deltas,
-                        reasoning_content=reasoning or None, reasoning=reasoning or None,
-                    )
-                    yield SimpleNamespace(
-                        choices=[SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)],
-                        model=model or "opencode-local", usage=None,
-                    )
-            finally:
+            prompt_body = {"agent": _AGENT_PRESET, "tools": disabled_tools, "parts": [{"type": "text", "text": prompt_text}]}
+            status, _ = _post_json(base, f"/session/{sid}/prompt_async", prompt_body, timeout_seconds)
+            if status not in (200, 204):
+                raise RuntimeError(f"opencode serve rejected the prompt (HTTP {status}).")
+
+            if not done.wait(timeout=timeout_seconds):
                 with contextlib.suppress(Exception):
-                    resp.close()
+                    _post_json(base, f"/session/{sid}/abort", {}, 5.0)
+                raise TimeoutError(f"opencode serve turn did not finish within {timeout_seconds:.0f}s.")
+            if outcome.get("error"):
+                raise RuntimeError(f"opencode serve turn failed: {outcome['error']}")
+            return self._final_text_and_reasoning(base, sid, timeout_seconds)
+        finally:
+            with contextlib.suppress(Exception):
+                req = urllib.request.Request(base.rstrip("/") + f"/session/{sid}", method="DELETE")
+                urllib.request.urlopen(req, timeout=5.0).close()
 
-        return _gen()
+    def _watch_events(
+        self, base: str, sid: str, connected: threading.Event, done: threading.Event, outcome: dict[str, Any],
+        timeout_seconds: float,
+    ) -> None:
+        """Consume the GLOBAL ``/event`` stream (opencode has no per-session subscribe filter),
+        keeping only events for *sid*, until the turn finishes or fails."""
+        req = urllib.request.Request(base.rstrip("/") + "/event")
+        req.add_header("Accept", "text/event-stream")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                connected.set()
+                for event in _iter_sse_json(resp):
+                    if done.is_set():
+                        return
+                    props = event.get("properties") or {}
+                    if props.get("sessionID") != sid:
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "session.idle":
+                        done.set()
+                        return
+                    if event_type == "session.error":
+                        error = props.get("error") or {}
+                        outcome["error"] = (error.get("data") or {}).get("message") or error.get("name") or error
+                        done.set()
+                        return
+                    if event_type == "session.status" and (props.get("status") or {}).get("type") == "idle":
+                        done.set()
+                        return
+                    if event_type == "message.updated":
+                        info = props.get("info") or {}
+                        if info.get("role") == "assistant" and info.get("error"):
+                            outcome["error"] = info["error"]
+                            done.set()
+                            return
+        except Exception as exc:
+            outcome.setdefault("error", f"{type(exc).__name__}: {exc}")
+            connected.set()
+            done.set()
+
+    def _final_text_and_reasoning(self, base: str, sid: str, timeout_seconds: float) -> tuple[str, str]:
+        """Ground truth of what the turn produced: the assistant message(s)' parts from
+        ``GET /session/{id}/message``, not the SSE stream (see module docstring)."""
+        data = _get_json(base, f"/session/{sid}/message", timeout_seconds) or []
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        for entry in data:
+            if not isinstance(entry, dict) or (entry.get("info") or {}).get("role") != "assistant":
+                continue
+            for part in entry.get("parts") or []:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text" and not part.get("ignored"):
+                    text_parts.append(part.get("text") or "")
+                elif part_type == "reasoning":
+                    reasoning_parts.append(part.get("text") or "")
+        return "".join(text_parts), "".join(reasoning_parts)
+
+
+def _effective_timeout(timeout: Any) -> float:
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    candidates = [getattr(timeout, attr, None) for attr in ("read", "write", "connect", "pool", "timeout")]
+    return max((float(v) for v in candidates if isinstance(v, (int, float))), default=_DEFAULT_TIMEOUT_SECONDS)

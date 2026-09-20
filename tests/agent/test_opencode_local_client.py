@@ -1,311 +1,239 @@
-"""Unit and integration tests for the OpenCode Local HTTP shim.
+"""Unit and integration tests for the OpenCode Local HTTP session-API shim.
 
-Covers the four things the plugin exists to get right:
-  1. per-model wire-dialect routing (mirrors ``_OPENCODE_API_MODE_PREFIXES``)
-  2. reasoning/thinking arrives as a structured field, never spliced into ``content``
-  3. tool calls arrive as structured ``tool_calls``, never as prose the model has to be coaxed
-     into emitting
-  4. streaming forwards each SSE chunk as it arrives, unbuffered
+Covers the things the plugin exists to get right, verified against evidence captured from a real
+``opencode serve`` v1.18.31 instance (session-based, not OpenAI-wire — see the module docstring in
+``agent/opencode_local_client.py``):
+  1. model must be set at session-create, never at prompt_async (reproducible server crash otherwise)
+  2. every one of opencode's own built-in tools is disabled per turn (Hermes' tool loop stays the
+     only thing that actually executes anything)
+  3. reasoning parts land on a structured field, never spliced into the visible response text
+  4. tool calls the model emits via the text bridge are extracted into structured tool_calls, not
+     left as visible prose
+  5. the final result comes from GET /session/{id}/message (ground truth), not reconstructed from
+     the SSE stream
+  6. a session.error turn raises, a turn that never goes idle times out and is aborted
 """
 
 from __future__ import annotations
 
 import json
+import queue
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import pytest
 
 from agent.opencode_local_client import (
     OpencodeLocalClient,
-    _iter_sse_events,
-    _parse_anthropic_response,
-    _parse_chat_response,
-    _parse_responses_response,
-    _to_anthropic_payload,
-    _to_chat_payload,
-    _to_responses_payload,
-    opencode_local_model_api_mode,
+    _format_messages_as_prompt,
+    _iter_sse_json,
+    _render_message_content,
+    _split_qualified_model,
 )
 
 
-# ── Per-model api_mode routing ──────────────────────────────────────────────────────────────
+# ── Small pure helpers ──────────────────────────────────────────────────────────────────────
 
 
-class TestOpencodeLocalModelApiMode:
-    @pytest.mark.parametrize("model", [
-        "muse-spark-1.3-contributor", "muse-spark-1.2", "gpt-5.1-codex", "gpt-5.1", "grok-4.1", "grok-4.1-fast",
-    ])
-    def test_codex_responses_family(self, model):
-        assert opencode_local_model_api_mode(model) == "codex_responses"
+class TestSplitQualifiedModel:
+    def test_simple_provider_and_model(self):
+        assert _split_qualified_model("opencode/big-pickle") == ("opencode", "big-pickle")
 
-    @pytest.mark.parametrize("model", [
-        "claude-sonnet-4-6", "claude-opus-4-6", "minimax-m2.5", "minimax-m3", "qwen3.7-max", "qwen3-max",
-    ])
-    def test_anthropic_messages_family(self, model):
-        assert opencode_local_model_api_mode(model) == "anthropic_messages"
+    def test_model_id_itself_contains_a_slash(self):
+        # OpenRouter's own model ids are vendor/model — only the FIRST segment is the provider.
+        assert _split_qualified_model("openrouter/qwen/qwen3.7-max") == ("openrouter", "qwen/qwen3.7-max")
 
-    @pytest.mark.parametrize("model", ["glm-5.2", "deepseek-v4-pro", "kimi-k2.7", "mimo-v2.5", "", None])
-    def test_chat_completions_fallback(self, model):
-        assert opencode_local_model_api_mode(model) == "chat_completions"
+    def test_unqualified_model_is_not_silently_accepted(self):
+        provider_id, model_id = _split_qualified_model("big-pickle")
+        assert provider_id == "big-pickle"
+        assert model_id == ""  # caller must reject this, see TestUnqualifiedModelRejected
 
-    def test_case_insensitive(self):
-        assert opencode_local_model_api_mode("Claude-Sonnet-4-6") == "anthropic_messages"
-        assert opencode_local_model_api_mode("GPT-5.1-Codex") == "codex_responses"
-
-    def test_a_single_fixed_mode_is_not_used_for_every_model(self):
-        modes = {opencode_local_model_api_mode(m) for m in
-                 ("claude-sonnet-4-6", "gpt-5.1-codex", "glm-5.2")}
-        assert modes == {"anthropic_messages", "codex_responses", "chat_completions"}
+    def test_empty(self):
+        assert _split_qualified_model(None) == ("", "")
+        assert _split_qualified_model("") == ("", "")
 
 
-# ── Payload builders ────────────────────────────────────────────────────────────────────────
+class TestRenderMessageContent:
+    def test_plain_string(self):
+        assert _render_message_content("hello") == "hello"
+
+    def test_none(self):
+        assert _render_message_content(None) == ""
+
+    def test_list_of_text_parts(self):
+        content = [{"type": "text", "text": "line one"}, {"type": "text", "text": "line two"}]
+        assert _render_message_content(content) == "line one\nline two"
 
 
-class TestPayloadBuilders:
-    _MESSAGES = [
-        {"role": "system", "content": "You are terse."},
-        {"role": "user", "content": "list files"},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "call_1", "function": {"name": "ls", "arguments": "{}"}}]},
-        {"role": "tool", "tool_call_id": "call_1", "content": "README.md"},
-    ]
-    _TOOLS = [{"type": "function", "function": {"name": "ls", "description": "list", "parameters": {}}}]
+class TestFormatMessagesAsPrompt:
+    def test_includes_transcript_and_tool_bridge(self):
+        messages = [{"role": "system", "content": "be terse"}, {"role": "user", "content": "list files"}]
+        tools = [{"type": "function", "function": {"name": "ls", "description": "list", "parameters": {}}}]
+        prompt = _format_messages_as_prompt(messages, tools=tools)
+        assert "list files" in prompt
+        assert "ls" in prompt
+        assert "<tool_call>" in prompt  # the bridge contract instructs the model to emit these
 
-    def test_chat_payload_passes_messages_through(self):
-        payload = _to_chat_payload("glm-5.2", self._MESSAGES, self._TOOLS, "auto", False)
-        assert payload["model"] == "glm-5.2"
-        assert payload["messages"] == self._MESSAGES
-        assert payload["tools"] == self._TOOLS
-        assert payload["tool_choice"] == "auto"
-        assert payload["stream"] is False
-
-    def test_responses_payload_extracts_system_as_instructions(self):
-        payload = _to_responses_payload("gpt-5.1-codex", self._MESSAGES, self._TOOLS, None, True)
-        assert payload["instructions"] == "You are terse."
-        assert payload["stream"] is True
-        types = [item["type"] for item in payload["input"]]
-        assert "function_call" in types
-        assert "function_call_output" in types
-        call = next(i for i in payload["input"] if i["type"] == "function_call")
-        assert call["name"] == "ls" and call["call_id"] == "call_1"
-        output = next(i for i in payload["input"] if i["type"] == "function_call_output")
-        assert output["call_id"] == "call_1" and output["output"] == "README.md"
-
-    def test_anthropic_payload_moves_system_out_of_messages(self):
-        payload = _to_anthropic_payload("claude-sonnet-4-6", self._MESSAGES, self._TOOLS, "auto", False, max_tokens=4096)
-        assert payload["system"] == "You are terse."
-        assert all(m["role"] != "system" for m in payload["messages"])
-        assert payload["max_tokens"] == 4096
-        assert payload["tools"][0]["name"] == "ls"
-        assert payload["tool_choice"] == {"type": "auto"}
-
-    def test_anthropic_payload_converts_tool_call_and_result(self):
-        payload = _to_anthropic_payload("claude-sonnet-4-6", self._MESSAGES, self._TOOLS, None, False, max_tokens=4096)
-        assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
-        tool_use = next(b for b in assistant_msg["content"] if b["type"] == "tool_use")
-        assert tool_use["name"] == "ls" and tool_use["id"] == "call_1"
-        tool_result_msg = payload["messages"][-1]
-        result_block = tool_result_msg["content"][0]
-        assert result_block["type"] == "tool_result"
-        assert result_block["tool_use_id"] == "call_1"
-        assert result_block["content"] == "README.md"
-
-    def test_anthropic_tool_choice_none_drops_tools(self):
-        payload = _to_anthropic_payload("claude-sonnet-4-6", self._MESSAGES, self._TOOLS, "none", False, max_tokens=4096)
-        assert "tools" not in payload
-
-
-# ── Response parsing: reasoning and tool calls must be structured, not prose ──────────────────
-
-
-class TestResponseParsing:
-    def test_chat_response_reasoning_is_not_appended_to_content(self):
-        data = {"choices": [{"message": {
-            "content": "The answer is 4.", "reasoning_content": "2 + 2 = 4, so the answer is 4.",
-        }, "finish_reason": "stop"}]}
-        content, reasoning, tool_calls, finish = _parse_chat_response(data)
-        assert content == "The answer is 4."
-        assert reasoning == "2 + 2 = 4, so the answer is 4."
-        assert tool_calls == []
-        assert finish == "stop"
-
-    def test_chat_response_tool_calls_are_structured(self):
-        data = {"choices": [{"message": {
-            "content": None, "tool_calls": [
-                {"id": "call_9", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}],
-        }, "finish_reason": "tool_calls"}]}
-        content, reasoning, tool_calls, finish = _parse_chat_response(data)
-        assert content == ""
-        assert finish == "tool_calls"
-        assert len(tool_calls) == 1
-        assert tool_calls[0].function.name == "read_file"
-        assert json.loads(tool_calls[0].function.arguments) == {"path": "a.py"}
-
-    def test_responses_response_splits_reasoning_text_and_function_calls(self):
-        data = {"output": [
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking about it..."}]},
-            {"type": "message", "content": [{"type": "output_text", "text": "done."}]},
-            {"type": "function_call", "call_id": "call_5", "name": "write_file", "arguments": '{"path": "b.py"}'},
-        ]}
-        content, reasoning, tool_calls, finish = _parse_responses_response(data)
-        assert content == "done."
-        assert reasoning == "thinking about it..."
-        assert finish == "tool_calls"
-        assert tool_calls[0].function.name == "write_file"
-
-    def test_anthropic_response_thinking_block_becomes_reasoning(self):
-        data = {"content": [
-            {"type": "thinking", "thinking": "Let me reason about this."},
-            {"type": "text", "text": "Here is the result."},
-        ], "stop_reason": "end_turn"}
-        content, reasoning, tool_calls, finish = _parse_anthropic_response(data)
-        assert content == "Here is the result."
-        assert reasoning == "Let me reason about this."
-        assert tool_calls == []
-        assert finish == "stop"
-
-    def test_anthropic_response_tool_use_block_becomes_tool_call(self):
-        data = {"content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"command": "ls"}},
-        ], "stop_reason": "tool_use"}
-        content, reasoning, tool_calls, finish = _parse_anthropic_response(data)
-        assert finish == "tool_calls"
-        assert tool_calls[0].function.name == "bash"
-        assert json.loads(tool_calls[0].function.arguments) == {"command": "ls"}
+    def test_instructs_the_model_not_to_use_its_own_tools(self):
+        prompt = _format_messages_as_prompt([{"role": "user", "content": "hi"}])
+        assert "own tools" in prompt.lower()
 
 
 # ── SSE plumbing ────────────────────────────────────────────────────────────────────────────
 
 
-class TestIterSseEvents:
-    def test_yields_one_event_per_data_block(self):
-        lines = [b'data: {"a": 1}\n', b"\n", b'data: {"a": 2}\n', b"\n", b"data: [DONE]\n", b"\n"]
-        events = list(_iter_sse_events(lines))
-        assert events == [{"a": 1}, {"a": 2}]
-
-    def test_multiline_data_block_is_joined(self):
-        lines = [b'data: {"a":\n', b'data: 1}\n', b"\n"]
-        events = list(_iter_sse_events(lines))
-        assert events == [{"a": 1}]
+class TestIterSseJson:
+    def test_yields_one_event_per_data_line(self):
+        lines = [b'data: {"a": 1}\n', b"\n", b'data: {"a": 2}\n', b"\n"]
+        assert list(_iter_sse_json(lines)) == [{"a": 1}, {"a": 2}]
 
     def test_comment_lines_are_ignored(self):
-        lines = [b": keep-alive\n", b'data: {"a": 1}\n', b"\n"]
-        events = list(_iter_sse_events(lines))
-        assert events == [{"a": 1}]
+        lines = [b": keep-alive\n", b'data: {"a": 1}\n']
+        assert list(_iter_sse_json(lines)) == [{"a": 1}]
 
     def test_malformed_event_is_skipped_not_fatal(self):
-        lines = [b"data: not json\n", b"\n", b'data: {"a": 1}\n', b"\n"]
-        events = list(_iter_sse_events(lines))
-        assert events == [{"a": 1}]
+        lines = [b"data: not json\n", b'data: {"a": 1}\n']
+        assert list(_iter_sse_json(lines)) == [{"a": 1}]
 
-    def test_streams_incrementally_not_batched(self):
-        """A generator that reads three chunks one at a time must not need the fourth
-        (terminating) line before yielding the first two events."""
-        seen: list[dict] = []
-
+    def test_streams_incrementally(self):
         def _lines():
             yield b'data: {"a": 1}\n'
-            yield b"\n"
-            seen.append("first event should already have been consumable")
             yield b'data: {"a": 2}\n'
-            yield b"\n"
             raise AssertionError("must not need to read past the second event to get it")
 
-        gen = _iter_sse_events(_lines())
+        gen = _iter_sse_json(_lines())
         assert next(gen) == {"a": 1}
         assert next(gen) == {"a": 2}
 
 
-# ── End-to-end against a stub local server ─────────────────────────────────────────────────
+# ── End-to-end against a stub opencode serve ───────────────────────────────────────────────
 
 
 class _StubOpencodeServer:
-    """A minimal HTTP stand-in for ``opencode serve`` that records the request path/body and
-    replies with a canned response per endpoint, streaming or not."""
+    """A minimal stand-in for ``opencode serve``'s session+SSE API. ``on_prompt_events`` are
+    broadcast on the global ``/event`` stream (sessionID auto-filled) the instant a
+    ``prompt_async`` POST lands, mirroring how the real server pushes events asynchronously."""
 
-    def __init__(self):
-        self.requests: list[tuple[str, dict]] = []
-        handler = self._make_handler()
-        self.httpd = HTTPServer(("127.0.0.1", 0), handler)
-        self.port = self.httpd.server_address[1]
-        self.base_url = f"http://127.0.0.1:{self.port}"
-        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self._thread.start()
+    def __init__(self, *, on_prompt_events=None, final_message_parts=None, tool_ids=("bash", "edit", "read"),
+                 config_providers=None, prompt_status=204):
+        self.requests: list[tuple[str, str, dict]] = []
+        self.sessions: dict[str, dict] = {}
+        self._on_prompt_events = list(on_prompt_events or [])
+        self._final_message_parts = final_message_parts if final_message_parts is not None else []
+        self._tool_ids = list(tool_ids)
+        self._config_providers = config_providers or {"providers": [], "default": {}}
+        self._prompt_status = prompt_status
+        self._sse_clients: list[queue.Queue] = []
+        self._sid_counter = 0
 
-    def _make_handler(self):
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
                 pass
 
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length) or b"{}")
-                outer.requests.append((self.path, body))
-                if self.path == "/v1/chat/completions":
-                    self._chat(body)
-                elif self.path == "/v1/responses":
-                    self._responses(body)
-                elif self.path == "/v1/messages":
-                    self._messages(body)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def _chat(self, body):
-                if body.get("stream"):
-                    self._sse([
-                        {"choices": [{"index": 0, "delta": {"reasoning_content": "thinking "}, "finish_reason": None}]},
-                        {"choices": [{"index": 0, "delta": {"reasoning_content": "more\nlines"}, "finish_reason": None}]},
-                        {"choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": "stop"}]},
-                    ])
-                    return
-                self._json({"choices": [{"message": {
-                    "content": "answer", "reasoning_content": "because",
-                }, "finish_reason": "stop"}], "usage": {}})
-
-            def _responses(self, body):
-                self._json({"output": [
-                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "codex thinking"}]},
-                    {"type": "message", "content": [{"type": "output_text", "text": "codex answer"}]},
-                ]})
-
-            def _messages(self, body):
-                self._json({"content": [
-                    {"type": "thinking", "thinking": "claude thinking"},
-                    {"type": "text", "text": "claude answer"},
-                ], "stop_reason": "end_turn"})
-
-            def _json(self, obj):
+            def _json(self, obj, status=200):
                 payload = json.dumps(obj).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def _sse(self, events):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.end_headers()
-                for event in events:
-                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+            def do_GET(self):
+                if self.path == "/global/health":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                if self.path == "/event":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                    q: queue.Queue = queue.Queue()
+                    outer._sse_clients.append(q)
+                    try:
+                        while True:
+                            item = q.get()
+                            if item is None:
+                                break
+                            self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                    except Exception:
+                        pass
+                    finally:
+                        with_ = outer._sse_clients
+                        if q in with_:
+                            with_.remove(q)
+                    return
+                if self.path == "/experimental/tool/ids":
+                    self._json(outer._tool_ids)
+                    return
+                if self.path == "/config/providers":
+                    self._json(outer._config_providers)
+                    return
+                if self.path.startswith("/session/") and self.path.endswith("/message"):
+                    self._json([{"info": {"role": "assistant"}, "parts": outer._final_message_parts}])
+                    return
+                self.send_response(404)
+                self.end_headers()
 
-        return Handler
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                outer.requests.append(("POST", self.path, body))
+                if self.path == "/session":
+                    outer._sid_counter += 1
+                    sid = f"ses_test{outer._sid_counter}"
+                    outer.sessions[sid] = body
+                    self._json({"id": sid, **body})
+                    return
+                if self.path.endswith("/prompt_async"):
+                    sid = self.path.split("/")[2]
+                    for event in outer._on_prompt_events:
+                        event = dict(event)
+                        event.setdefault("properties", {})
+                        event["properties"] = {"sessionID": sid, **event["properties"]}
+                        for client_queue in list(outer._sse_clients):
+                            client_queue.put(event)
+                    if outer._prompt_status == 204:
+                        self.send_response(204)
+                        self.end_headers()
+                    else:
+                        self._json({}, status=outer._prompt_status)
+                    return
+                if self.path.endswith("/abort"):
+                    self._json({})
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_DELETE(self):
+                outer.requests.append(("DELETE", self.path, {}))
+                self.send_response(200)
+                self.end_headers()
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread.start()
 
     def shutdown(self):
+        for q in list(self._sse_clients):
+            q.put(None)
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_server_singleton(monkeypatch):
+    # _OpencodeLocalServer is a process-wide singleton keyed on (command, args); reset it per test
+    # so one test's (now torn-down) stub server URL and cached tool-ids never leak into another.
+    from agent.opencode_local_client import _OpencodeLocalServer
+
+    monkeypatch.setattr(_OpencodeLocalServer, "_instances", {})
 
 
 @pytest.fixture
@@ -317,70 +245,144 @@ def stub_server():
         server.shutdown()
 
 
-@pytest.fixture(autouse=True)
-def _reset_server_singleton(monkeypatch):
-    # ``_OpencodeLocalServer`` is a process-wide singleton keyed on (command, args) so a real
-    # `opencode serve` is reused across requests within one process — but that means it would
-    # also cache one test's (now torn-down) stub server's URL for every later test that builds a
-    # client with the same command/args. Reset it so each test gets its own resolution.
-    from agent.opencode_local_client import _OpencodeLocalServer
-
-    monkeypatch.setattr(_OpencodeLocalServer, "_instances", {})
+def _client_for(stub, monkeypatch) -> OpencodeLocalClient:
+    monkeypatch.setenv("HERMES_OPENCODE_LOCAL_URL", stub.base_url)
+    return OpencodeLocalClient(command="opencode", args=["serve"])
 
 
-@pytest.fixture
-def local_client(stub_server, monkeypatch):
-    monkeypatch.setenv("HERMES_OPENCODE_LOCAL_URL", stub_server.base_url)
-    client = OpencodeLocalClient(command="opencode", args=["serve"])
-    yield client
-    client.close()
+class TestUnqualifiedModelRejected:
+    def test_bare_model_id_raises_before_any_request(self, stub_server, monkeypatch):
+        client = _client_for(stub_server, monkeypatch)
+        with pytest.raises(RuntimeError, match="providerID/modelID"):
+            client.chat.completions.create(model="big-pickle", messages=[{"role": "user", "content": "hi"}])
+        assert stub_server.requests == []  # rejected locally — never reached the server
 
 
-class TestOpencodeLocalClientRouting:
-    def test_chat_family_model_hits_chat_completions_endpoint(self, local_client, stub_server):
-        result = local_client.chat.completions.create(model="glm-5.2", messages=[{"role": "user", "content": "hi"}])
-        assert stub_server.requests[0][0] == "/v1/chat/completions"
-        assert result.choices[0].message.content == "answer"
-        # Reasoning is a distinct field, never folded into the visible response text.
-        assert result.choices[0].message.reasoning == "because"
-        assert "because" not in result.choices[0].message.content
+class TestOpencodeLocalTurnHappyPath:
+    def test_model_set_at_create_never_at_prompt(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": "DONE"}]
+        client = _client_for(stub_server, monkeypatch)
+        client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
 
-    def test_codex_family_model_hits_responses_endpoint(self, local_client, stub_server):
-        result = local_client.chat.completions.create(model="gpt-5.1-codex", messages=[{"role": "user", "content": "hi"}])
-        assert stub_server.requests[0][0] == "/v1/responses"
-        assert result.choices[0].message.content == "codex answer"
-        assert result.choices[0].message.reasoning == "codex thinking"
+        create_calls = [r for r in stub_server.requests if r[1] == "/session"]
+        prompt_calls = [r for r in stub_server.requests if r[1].endswith("/prompt_async")]
+        assert len(create_calls) == 1
+        assert create_calls[0][2]["model"] == {"providerID": "opencode", "id": "big-pickle"}
+        assert "model" not in prompt_calls[0][2]  # the reproducible SQLite crash trigger
 
-    def test_claude_family_model_hits_messages_endpoint(self, local_client, stub_server):
-        result = local_client.chat.completions.create(model="claude-sonnet-4-6", messages=[{"role": "user", "content": "hi"}])
-        assert stub_server.requests[0][0] == "/v1/messages"
-        assert result.choices[0].message.content == "claude answer"
-        assert result.choices[0].message.reasoning == "claude thinking"
+    def test_disables_every_builtin_tool_on_the_prompt(self, stub_server, monkeypatch):
+        stub_server._tool_ids = ["bash", "edit", "read"]
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": "DONE"}]
+        client = _client_for(stub_server, monkeypatch)
+        client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
 
+        prompt_call = next(r for r in stub_server.requests if r[1].endswith("/prompt_async"))
+        assert prompt_call[2]["tools"] == {"bash": False, "edit": False, "read": False}
 
-class TestOpencodeLocalClientStreaming:
-    def test_stream_forwards_each_chunk_preserving_line_breaks(self, local_client, stub_server):
-        stream = local_client.chat.completions.create(
-            model="glm-5.2", messages=[{"role": "user", "content": "hi"}], stream=True,
+    def test_reasoning_lands_on_a_separate_field(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [
+            {"type": "reasoning", "text": "thinking about it..."},
+            {"type": "text", "text": "The answer is 4."},
+        ]
+        client = _client_for(stub_server, monkeypatch)
+        result = client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "2+2?"}])
+
+        assert result.choices[0].message.content == "The answer is 4."
+        assert result.choices[0].message.reasoning == "thinking about it..."
+        assert "thinking" not in result.choices[0].message.content
+
+    def test_tool_call_bridge_is_extracted_not_left_as_prose(self, stub_server, monkeypatch):
+        tool_call_text = (
+            "<tool_call>"
+            '{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}'
+            "</tool_call>"
         )
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": tool_call_text}]
+        client = _client_for(stub_server, monkeypatch)
+        result = client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "list files"}])
+
+        message = result.choices[0].message
+        assert message.content in (None, "")
+        assert result.choices[0].finish_reason == "tool_calls"
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].function.name == "ls"
+
+    def test_uses_final_message_endpoint_not_sse_for_content(self, stub_server, monkeypatch):
+        # The SSE stream carries no text/reasoning here at all — only the completion signal — yet
+        # the final content still comes through correctly from GET /session/{id}/message.
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": "ground truth wins"}]
+        client = _client_for(stub_server, monkeypatch)
+        result = client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "ground truth wins"
+
+    def test_session_deleted_after_the_turn(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": "DONE"}]
+        client = _client_for(stub_server, monkeypatch)
+        client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
+        deletes = [r for r in stub_server.requests if r[0] == "DELETE"]
+        assert len(deletes) == 1
+
+
+class TestOpencodeLocalTurnFailureModes:
+    def test_session_error_event_raises(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = [
+            {"type": "session.error", "properties": {"error": {"data": {"message": "boom"}}}},
+        ]
+        client = _client_for(stub_server, monkeypatch)
+        with pytest.raises(RuntimeError, match="boom"):
+            client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
+
+    def test_turn_that_never_idles_times_out_and_aborts(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = []  # never signals completion
+        client = _client_for(stub_server, monkeypatch)
+        # Generous budget: this must give the SSE connect + prompt POST room to complete under
+        # test-runner scheduling noise, so the timeout is the DONE wait (which aborts), not a
+        # spurious connect-stage timeout (which correctly would not abort).
+        with pytest.raises(TimeoutError):
+            client.chat.completions.create(
+                model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}], timeout=3.0)
+        aborts = [r for r in stub_server.requests if r[1].endswith("/abort")]
+        assert len(aborts) == 1
+
+
+class TestOpencodeLocalStreaming:
+    def test_stream_preserves_embedded_newlines(self, stub_server, monkeypatch):
+        stub_server._on_prompt_events = [{"type": "session.idle", "properties": {}}]
+        stub_server._final_message_parts = [{"type": "text", "text": "line one\nline two"}]
+        client = _client_for(stub_server, monkeypatch)
+        stream = client.chat.completions.create(
+            model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}], stream=True)
         chunks = list(stream)
-        reasoning_chunks = [c.choices[0].delta.reasoning for c in chunks if c.choices[0].delta.reasoning]
-        assert reasoning_chunks == ["thinking ", "more\nlines"]
-        # The embedded newline from the server survives untouched — no re-flowing/re-chunking.
-        assert "\n" in reasoning_chunks[1]
-        content_chunks = [c.choices[0].delta.content for c in chunks if c.choices[0].delta.content]
-        assert content_chunks == ["answer"]
-        assert chunks[-1].choices[0].finish_reason == "stop"
+        contents = [c.choices[0].delta.content for c in chunks if getattr(c, "choices", None) and c.choices[0].delta.content]
+        assert contents == ["line one\nline two"]
+
+
+class TestOpencodeLocalListModels:
+    def test_flattens_provider_and_model_ids(self, stub_server, monkeypatch):
+        stub_server._config_providers = {
+            "providers": [
+                {"id": "opencode", "models": {"big-pickle": {}, "mimo-v2.5-free": {}}},
+                {"id": "openrouter", "models": {"qwen/qwen3.7-max": {}}},
+            ],
+            "default": {},
+        }
+        client = _client_for(stub_server, monkeypatch)
+        models = client.list_models()
+        assert set(models) == {"opencode/big-pickle", "opencode/mimo-v2.5-free", "openrouter/qwen/qwen3.7-max"}
 
 
 class TestOpencodeLocalServerLifecycle:
     def test_reuses_external_server_without_spawning(self, stub_server, monkeypatch):
-        """HERMES_OPENCODE_LOCAL_URL lets an operator-managed `opencode serve` be reused —
-        no subprocess spawned, so nothing for this process to orphan."""
         monkeypatch.setenv("HERMES_OPENCODE_LOCAL_URL", stub_server.base_url)
         with patch("subprocess.Popen") as mock_popen:
             client = OpencodeLocalClient(command="opencode", args=["serve"])
-            client.chat.completions.create(model="glm-5.2", messages=[{"role": "user", "content": "hi"}])
+            client.list_models()
             mock_popen.assert_not_called()
             client.close()
 
@@ -388,4 +390,4 @@ class TestOpencodeLocalServerLifecycle:
         monkeypatch.delenv("HERMES_OPENCODE_LOCAL_URL", raising=False)
         client = OpencodeLocalClient(command="definitely-not-a-real-opencode-binary-xyz", args=["serve"])
         with pytest.raises(RuntimeError, match="Could not start opencode-local command"):
-            client.chat.completions.create(model="glm-5.2", messages=[{"role": "user", "content": "hi"}])
+            client.chat.completions.create(model="opencode/big-pickle", messages=[{"role": "user", "content": "hi"}])
