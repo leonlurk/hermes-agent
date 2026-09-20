@@ -1,0 +1,5 @@
+name: opencode-local
+kind: model-provider
+version: 1.0.0
+description: OpenCode CLI via a local `opencode serve` subprocess (no relay, no API key)
+author: Nous Research
